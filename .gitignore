@@ -1,0 +1,15 @@
+# This repo tracks only the Video Sync Architect app.
+# Everything else in this directory is ignored by default.
+/*
+
+!.gitignore
+!README.md
+!video_sync_architect/
+!video_sync_architect/**
+
+# Bytecode / virtualenv
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
