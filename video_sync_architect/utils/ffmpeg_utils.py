@@ -146,9 +146,11 @@ def build_sync_command(input2_path: str, output_path: str,
         cmd += ["-t", f"{input1_duration:.6f}", output_path]
     else:
         cmd += ["-i", input2_path]
-        offset_ms = int(offset_seconds * 1000)
+        # Match tpad time precision: adelay accepts fractional milliseconds
+        # (FFmpeg ≥4); int() truncation caused up to ~0.5 ms A/V skew.
+        delay_ms = offset_seconds * 1000.0
         vf = f"tpad=start_duration={offset_seconds:.6f}:start_mode=clone"
-        af = f"adelay={offset_ms}|{offset_ms}:all=1"
+        af = f"adelay={delay_ms:.6f}|{delay_ms:.6f}:all=1"
         cmd += [
             "-vf", vf,
             "-af", af,

@@ -22,6 +22,35 @@ from ..utils.hashing import (
 from ..utils.ffmpeg_utils import extract_frames_range, extract_frame_at_index
 
 
+def _phash_hamming_at_primary_frame(
+    filepath: str,
+    fps: float,
+    frame_idx: int,
+    ref_hash,
+) -> Optional[int]:
+    raw = extract_frame_at_index(filepath, frame_idx, fps)
+    if raw is None:
+        return None
+    return hamming_distance(ref_hash, compute_phash_from_raw(raw))
+
+
+def _parabolic_subdelta_from_hd_neighbors(
+    hd_minus: Optional[int],
+    hd_zero: int,
+    hd_plus: Optional[int],
+) -> float:
+    """Fractional primary-frame correction; same geometry as sample_offsets_visually."""
+    if hd_minus is None or hd_plus is None:
+        return 0.0
+    denom = float(hd_minus - 2 * hd_zero + hd_plus)
+    if denom <= 1e-9:
+        return 0.0
+    cand = 0.5 * (hd_minus - hd_plus) / denom
+    if cand <= -0.95 or cand >= 0.95:
+        return 0.0
+    return float(cand)
+
+
 @dataclass
 class SyncResult:
     offset_seconds: float
@@ -146,39 +175,56 @@ class VisualSyncEngine(SyncEngine):
         if is_cancelled():
             return None
 
-        # --- Phase 2: Fine scan ---
-        if best_distance > 0:
-            window_start = max(0, best_frame - self.fine_window)
-            window_end = min(total_frames_p, best_frame + self.fine_window + 1)
-            log(f"Phase 2: Fine scan frames {window_start}-{window_end}...", 0.65)
+        # --- Phase 2: Fine scan (always: coarse can hit HD=0 early while
+        #     the true Hamming minimum sits between integer frames).
+        window_start = max(0, best_frame - self.fine_window)
+        window_end = min(total_frames_p, best_frame + self.fine_window + 1)
+        log(f"Phase 2: Fine scan frames {window_start}-{window_end}...", 0.65)
 
-            fine_total = window_end - window_start
-            fine_count = 0
+        fine_total = window_end - window_start
+        fine_count = 0
 
-            for frame_idx, raw_data in extract_frames_range(
-                primary.filepath, window_start, window_end, primary.fps, step=1
-            ):
-                if is_cancelled():
-                    return None
+        for frame_idx, raw_data in extract_frames_range(
+            primary.filepath, window_start, window_end, primary.fps, step=1
+        ):
+            if is_cancelled():
+                return None
 
-                h = compute_phash_from_raw(raw_data)
-                dist = hamming_distance(ref_hash, h)
+            h = compute_phash_from_raw(raw_data)
+            dist = hamming_distance(ref_hash, h)
 
-                if dist < best_distance:
-                    best_distance = dist
-                    best_frame = frame_idx
-                    t = primary.frame_to_time(frame_idx)
-                    log(f"  Fine: frame {frame_idx} (t={t:.3f}s) HD={dist}", -1)
+            if dist < best_distance:
+                best_distance = dist
+                best_frame = frame_idx
+                t = primary.frame_to_time(frame_idx)
+                log(f"  Fine: frame {frame_idx} (t={t:.3f}s) HD={dist}", -1)
 
-                if dist == 0:
-                    break
+            fine_count += 1
+            if fine_total > 0:
+                progress = 0.65 + 0.30 * (fine_count / fine_total)
+                log("", progress)
 
-                fine_count += 1
-                if fine_total > 0:
-                    progress = 0.65 + 0.30 * (fine_count / fine_total)
-                    log("", progress)
-
-        matched_time = primary.frame_to_time(best_frame)
+        # --- Sub-frame: parabolic fit on Hamming at (F-1, F, F+1) ---
+        hd_minus = (
+            _phash_hamming_at_primary_frame(
+                primary.filepath, primary.fps, best_frame - 1, ref_hash,
+            )
+            if best_frame > 0
+            else None
+        )
+        hd_plus = (
+            _phash_hamming_at_primary_frame(
+                primary.filepath, primary.fps, best_frame + 1, ref_hash,
+            )
+            if best_frame < total_frames_p - 1
+            else None
+        )
+        sub_delta = _parabolic_subdelta_from_hd_neighbors(
+            hd_minus, best_distance, hd_plus,
+        )
+        matched_time = (
+            (best_frame + sub_delta) / primary.fps if primary.fps > 0 else 0.0
+        )
         offset_seconds = matched_time - ref_time
 
         if best_distance <= hamming_threshold // 3:
@@ -199,10 +245,16 @@ class VisualSyncEngine(SyncEngine):
         )
 
         direction = "after" if offset_seconds >= 0 else "before"
+        sub_note = (
+            f" (sub-frame {sub_delta:+.3f} fr)"
+            if abs(sub_delta) > 1e-6
+            else ""
+        )
         log(
-            f"Match found: frame {best_frame} (t={matched_time:.3f}s) HD={best_distance} "
+            f"Match found: frame {best_frame}{sub_note} "
+            f"(t={matched_time:.4f}s) HD={best_distance} "
             f"[{confidence}]\n"
-            f"Offset: {offset_seconds:+.3f}s (Input 2 starts {direction} Input 1)",
+            f"Offset: {offset_seconds:+.4f}s (Input 2 starts {direction} Input 1)",
             0.95,
         )
 
@@ -309,42 +361,38 @@ class VisualSyncEngine(SyncEngine):
             return None
 
         # --- Fine scan around the winning frame using the winning ref ---
-        if winner_dist > 0:
-            window_start = max(0, winner_frame - self.fine_window)
-            window_end = min(total_frames_p, winner_frame + self.fine_window + 1)
-            log(
-                f"Phase 2: Fine scan frames {window_start}-{window_end} "
-                f"with winning reference...",
-                0.65,
-            )
+        window_start = max(0, winner_frame - self.fine_window)
+        window_end = min(total_frames_p, winner_frame + self.fine_window + 1)
+        log(
+            f"Phase 2: Fine scan frames {window_start}-{window_end} "
+            f"with winning reference...",
+            0.65,
+        )
 
-            fine_total = window_end - window_start
-            fine_count = 0
+        fine_total = window_end - window_start
+        fine_count = 0
 
-            for frame_idx, raw_data in extract_frames_range(
-                primary.filepath, window_start, window_end, primary.fps, step=1
-            ):
-                if is_cancelled():
-                    return None
+        for frame_idx, raw_data in extract_frames_range(
+            primary.filepath, window_start, window_end, primary.fps, step=1
+        ):
+            if is_cancelled():
+                return None
 
-                h = compute_phash_from_raw(raw_data)
-                d = hamming_distance(winner_hash, h)
+            h = compute_phash_from_raw(raw_data)
+            d = hamming_distance(winner_hash, h)
 
-                if d < winner_dist:
-                    winner_dist = d
-                    winner_frame = frame_idx
-                    log(
-                        f"  Fine: frame {frame_idx} "
-                        f"(t={primary.frame_to_time(frame_idx):.3f}s) HD={d}",
-                        -1,
-                    )
+            if d < winner_dist:
+                winner_dist = d
+                winner_frame = frame_idx
+                log(
+                    f"  Fine: frame {frame_idx} "
+                    f"(t={primary.frame_to_time(frame_idx):.3f}s) HD={d}",
+                    -1,
+                )
 
-                if d == 0:
-                    break
-
-                fine_count += 1
-                if fine_total > 0:
-                    log("", 0.65 + 0.30 * (fine_count / fine_total))
+            fine_count += 1
+            if fine_total > 0:
+                log("", 0.65 + 0.30 * (fine_count / fine_total))
 
         # --- Build the SyncResult ---
         if winner_dist > hamming_threshold * 2:
@@ -355,7 +403,28 @@ class VisualSyncEngine(SyncEngine):
             )
             return None
 
-        matched_time = primary.frame_to_time(winner_frame)
+        hd_minus_m = (
+            _phash_hamming_at_primary_frame(
+                primary.filepath, primary.fps, winner_frame - 1, winner_hash,
+            )
+            if winner_frame > 0
+            else None
+        )
+        hd_plus_m = (
+            _phash_hamming_at_primary_frame(
+                primary.filepath, primary.fps, winner_frame + 1, winner_hash,
+            )
+            if winner_frame < total_frames_p - 1
+            else None
+        )
+        sub_delta_m = _parabolic_subdelta_from_hd_neighbors(
+            hd_minus_m, winner_dist, hd_plus_m,
+        )
+        matched_time = (
+            (winner_frame + sub_delta_m) / primary.fps
+            if primary.fps > 0
+            else 0.0
+        )
         offset_seconds = matched_time - winner_time
 
         if winner_dist <= hamming_threshold // 3:
@@ -376,11 +445,16 @@ class VisualSyncEngine(SyncEngine):
         )
 
         direction = "after" if offset_seconds >= 0 else "before"
+        sub_note_m = (
+            f" (sub-frame {sub_delta_m:+.3f} fr)"
+            if abs(sub_delta_m) > 1e-6
+            else ""
+        )
         log(
-            f"Multi-ref match: Primary frame {winner_frame} "
-            f"(t={matched_time:.3f}s) <-> Target t={winner_time:.3f}s "
+            f"Multi-ref match: Primary frame {winner_frame}{sub_note_m} "
+            f"(t={matched_time:.4f}s) <-> Target t={winner_time:.3f}s "
             f"HD={winner_dist} [{confidence}]\n"
-            f"Offset: {offset_seconds:+.3f}s (Input 2 starts {direction} Input 1)",
+            f"Offset: {offset_seconds:+.4f}s (Input 2 starts {direction} Input 1)",
             0.95,
         )
 

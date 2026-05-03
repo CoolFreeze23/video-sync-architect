@@ -56,11 +56,14 @@ class PairListSyncWorker(QThread):
     # audio_mode / scene_cut_mode: "off", "verify", "fallback"
     #   verify   = run after visual, log agreement / disagreement
     #   fallback = same as verify, AND take over if visual fails
+    # constant_offset_export_only: never use segmented/black-filler export;
+    #   always one global offset (median from dense samples when available).
     def __init__(self, pairs: list[tuple[str, str]],
                  hamming_threshold: int, generate_preview: bool,
                  multi_ref_mode: str = "off", num_refs: int = 5,
                  audio_mode: str = "off", scene_cut_mode: str = "off",
-                 debug_verify: bool = False):
+                 debug_verify: bool = False,
+                 constant_offset_export_only: bool = False):
         super().__init__()
         self.pairs = pairs
         self.hamming_threshold = hamming_threshold
@@ -70,6 +73,7 @@ class PairListSyncWorker(QThread):
         self.audio_mode = audio_mode
         self.scene_cut_mode = scene_cut_mode
         self.debug_verify = debug_verify
+        self.constant_offset_export_only = constant_offset_export_only
         self._cancelled = False
 
     def cancel(self):
@@ -429,12 +433,21 @@ class PairListSyncWorker(QThread):
                             f"robust {var_rob * 1000:.0f} ms "
                             f"(segmented threshold {VARIANCE_TRIGGER_S * 1000:.0f} ms)."
                         )
-                        if var_rob > VARIANCE_TRIGGER_S:
-                            use_segmented = True
+                        use_segmented = var_rob > VARIANCE_TRIGGER_S
+                        if use_segmented:
                             self.log_signal.emit(
-                                "Variable offset detected -> SEGMENTED sync mode."
+                                "Variable offset detected -> would use SEGMENTED "
+                                "sync (black boundaries + piecewise encode)."
                             )
-                        else:
+                        if use_segmented and self.constant_offset_export_only:
+                            self.log_signal.emit(
+                                "Constant-offset export only: skipping segmented "
+                                "mode — one global trim/pad from median dense offset "
+                                "(no black filler segments, no piecewise re-encode)."
+                            )
+                            use_segmented = False
+
+                        if not use_segmented:
                             refined = engine.aggregate_offset_samples(samples)
                             if refined is not None:
                                 delta_ms = (refined - result.offset_seconds) * 1000
@@ -967,6 +980,18 @@ class MainWindow(QMainWindow):
         self._preview_check.setChecked(True)
         settings_layout.addWidget(self._preview_check)
 
+        self._constant_offset_check = QCheckBox(
+            "Constant offset export only (no segmented / black filler / piecewise encode)"
+        )
+        self._constant_offset_check.setChecked(False)
+        self._constant_offset_check.setToolTip(
+            "When dense sampling sees a drifting offset, the app normally builds "
+            "segments (blackdetect boundaries, filler gaps, per-chunk encode). "
+            "Check this for sources that only need one global shift: always "
+            "export a single trim-or-pad pass (faster; typical for uniform A/V lag)."
+        )
+        settings_layout.addWidget(self._constant_offset_check)
+
         self._debug_verify_check = QCheckBox(
             "Debug Mode: verify synced output (sub-frame strict) and write "
             "drift report (slower; ~3-8 min/pair on long files)"
@@ -1084,6 +1109,7 @@ class MainWindow(QMainWindow):
         audio_mode = self._audio_combo.currentData()
         cut_mode = self._cut_combo.currentData()
         debug_verify = self._debug_verify_check.isChecked()
+        constant_offset_only = self._constant_offset_check.isChecked()
 
         mode_label = {
             "off": "single ref",
@@ -1104,13 +1130,15 @@ class MainWindow(QMainWindow):
             f"Audio VAD: {verify_label.get(audio_mode, audio_mode)} | "
             f"Scene-Cut: {verify_label.get(cut_mode, cut_mode)} | "
             f"Difference preview: {'on' if preview else 'off'} | "
+            f"Constant-offset export: {'on' if constant_offset_only else 'off'} | "
             f"Debug verify: {'on' if debug_verify else 'off'}"
         )
 
         worker = PairListSyncWorker(pairs, threshold, preview,
                                     multi_ref_mode=multi_mode, num_refs=num_refs,
                                     audio_mode=audio_mode, scene_cut_mode=cut_mode,
-                                    debug_verify=debug_verify)
+                                    debug_verify=debug_verify,
+                                    constant_offset_export_only=constant_offset_only)
         worker.log_signal.connect(self._on_log)
         worker.scan_progress.connect(self._scan_bar.set_progress)
         worker.export_progress.connect(self._export_bar.set_progress)
