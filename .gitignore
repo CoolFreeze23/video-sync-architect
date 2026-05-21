@@ -1,11 +1,11 @@
-# This repo tracks only the Video Sync Architect app.
-# Everything else in this directory is ignored by default.
+# This repo tracks the Video Sync Architect app and Subtitle Merger tool.
 /*
 
 !.gitignore
 !README.md
 !video_sync_architect/
 !video_sync_architect/**
+!batch_2srt2ass.py
 
 # Bytecode / virtualenv
 __pycache__/
