@@ -106,7 +106,7 @@ def parse_srt(path: Path) -> list[dict]:
 # ASS generation
 # ---------------------------------------------------------------------------
 
-TRACK_TITLE = "English + Portuguese For Julia <3"
+TRACK_TITLE = "For Julia <3"
 
 def build_ass(
     script_info: list[str],
@@ -213,17 +213,12 @@ def match_files(
     pairs.sort(key=lambda p: p[0].lower())
     return pairs, unmatched_top, unmatched_bot
 
-PLEX_TRACK_LABEL = "English + Portuguese For Julia"
-
 def output_name(top_srt: str) -> str:
-    """Derive output .ass filename in Plex-compatible format.
-
-    Plex reads: MovieName.LanguageCode.Description.ass
-    """
+    """Derive output .ass filename: {basename}.pt.ass"""
     stem = Path(top_srt).stem
     cleaned = LANG_SUFFIXES.sub("", stem)
     cleaned = LANG_SUFFIXES.sub("", cleaned)
-    return f"{cleaned}.pt.{PLEX_TRACK_LABEL}.ass"
+    return f"{cleaned}.pt.ass"
 
 # ---------------------------------------------------------------------------
 # FFmpeg helpers
@@ -246,10 +241,13 @@ def find_ffmpeg() -> tuple[str, str]:
             shutil.which("ffprobe") or "ffprobe")
 
 
+FORCED_TITLE_RE = re.compile(r"\bforced\b", re.IGNORECASE)
+
+
 def probe_subtitles(mkv_path: Path) -> list[dict]:
     """Return a list of subtitle stream dicts from an MKV file.
 
-    Each dict has keys: index (int), codec, language, title.
+    Each dict has keys: index (int), codec, language, title, forced (bool).
     """
     _, ffprobe = find_ffmpeg()
     cmd = [
@@ -267,11 +265,15 @@ def probe_subtitles(mkv_path: Path) -> list[dict]:
     tracks: list[dict] = []
     for s in data.get("streams", []):
         tags = s.get("tags", {})
+        disp = s.get("disposition", {})
+        title = tags.get("title", "")
+        forced = bool(disp.get("forced", 0)) or bool(FORCED_TITLE_RE.search(title))
         tracks.append({
             "index": s["index"],
             "codec": s.get("codec_name", "?"),
             "language": tags.get("language", "und"),
-            "title": tags.get("title", ""),
+            "title": title,
+            "forced": forced,
         })
     return tracks
 
@@ -305,10 +307,15 @@ ENG_TAGS = {"en", "eng", "english"}
 POR_TAGS = {"pt", "por", "portuguese"}
 
 
-def auto_pick_tracks(tracks: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Partition tracks into (english_candidates, portuguese_candidates)."""
-    eng = [t for t in tracks if t["language"].lower() in ENG_TAGS]
-    por = [t for t in tracks if t["language"].lower() in POR_TAGS]
+def auto_pick_tracks(tracks: list[dict], skip_forced: bool = True) -> tuple[list[dict], list[dict]]:
+    """Partition tracks into (english_candidates, portuguese_candidates).
+
+    When skip_forced is True, tracks flagged as forced are excluded since
+    they typically only contain sign/song translations.
+    """
+    pool = [t for t in tracks if not (skip_forced and t.get("forced"))]
+    eng = [t for t in pool if t["language"].lower() in ENG_TAGS]
+    por = [t for t in pool if t["language"].lower() in POR_TAGS]
     return eng, por
 
 # ---------------------------------------------------------------------------
@@ -960,6 +967,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.top_file_paths: dict[str, Path] = {}
         self.bot_file_paths: dict[str, Path] = {}
         self.saved_templates: dict[str, str] = load_templates()
+        self._intermediate_files: list[Path] = []
 
         self._build_ui()
 
@@ -978,6 +986,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         )
         self.mkv_label.pack(side="left", fill="x", expand=True)
         ttk.Button(mkv_frame, text="Browse MKV", command=self._browse_mkv).pack(side="left", padx=(6, 0))
+        self.skip_forced_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(mkv_frame, text="Skip forced",
+                         variable=self.skip_forced_var).pack(side="left", padx=(6, 0))
         if HAS_DND:
             self.mkv_label.drop_target_register(DND_FILES)
             self.mkv_label.dnd_bind("<<Drop>>", self._on_drop_mkv)
@@ -1053,6 +1064,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         ttk.Button(btn_row, text="Edit Pair", command=self._edit_pair).pack(side="left", padx=4)
         ttk.Button(btn_row, text="Remove Pair", command=self._remove_pair).pack(side="left", padx=4)
         ttk.Button(btn_row, text="Convert All", command=self._convert_all).pack(side="right", padx=4)
+        self.cleanup_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(btn_row, text="Clean up intermediate files",
+                         variable=self.cleanup_var).pack(side="right", padx=8)
 
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(self, textvariable=self.status_var, relief="sunken", anchor="w", padding=4).pack(
@@ -1244,7 +1258,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 messagebox.showwarning("No subtitles", f"No subtitle tracks found in:\n{mkv.name}")
                 continue
 
-            eng_tracks, por_tracks = auto_pick_tracks(tracks)
+            eng_tracks, por_tracks = auto_pick_tracks(
+                tracks, skip_forced=self.skip_forced_var.get(),
+            )
 
             eng_pick = self._resolve_track(mkv.name, "English (Top)", eng_tracks, tracks)
             if eng_pick is None:
@@ -1274,6 +1290,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 messagebox.showerror("Extraction failed", f"{mkv.name}:\n{e}")
                 continue
 
+            self._intermediate_files.append(eng_out)
+            self._intermediate_files.append(por_out)
+
             both_ass = eng_ext == ".ass" and por_ext == ".ass"
             if both_ass:
                 any_ass = True
@@ -1282,6 +1301,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 try:
                     eng_prepared = prepare_ass_for_merge(eng_out, is_portuguese=False)
                     por_prepared = prepare_ass_for_merge(por_out, is_portuguese=True)
+                    self._intermediate_files.append(eng_prepared)
+                    self._intermediate_files.append(por_prepared)
                     eng_out = eng_prepared
                     por_out = por_prepared
                 except Exception as e:
@@ -1354,8 +1375,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tree.pack(padx=8, pady=4, fill="both")
 
         for t in tracks:
+            title_disp = t["title"]
+            if t.get("forced"):
+                title_disp = "[FORCED] " + title_disp
             tree.insert("", "end", iid=str(t["index"]),
-                        values=(t["index"], t["language"], t["codec"], t["title"]))
+                        values=(t["index"], t["language"], t["codec"], title_disp))
         if tracks:
             tree.selection_set(str(tracks[0]["index"]))
 
@@ -1765,7 +1789,20 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             except Exception as e:
                 errors.append(f"{tf}: {e}")
 
+        cleaned = 0
+        if self.cleanup_var.get() and converted > 0:
+            for f in self._intermediate_files:
+                try:
+                    if f.is_file():
+                        f.unlink()
+                        cleaned += 1
+                except OSError:
+                    pass
+            self._intermediate_files.clear()
+
         msg = f"Converted {converted}/{len(self.pairs)} pair(s)."
+        if cleaned:
+            msg += f"\nCleaned up {cleaned} intermediate file(s)."
         if errors:
             msg += "\n\nErrors:\n" + "\n".join(errors)
         where = out_dir or "output folder"
