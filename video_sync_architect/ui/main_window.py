@@ -63,7 +63,8 @@ class PairListSyncWorker(QThread):
                  multi_ref_mode: str = "off", num_refs: int = 5,
                  audio_mode: str = "off", scene_cut_mode: str = "off",
                  debug_verify: bool = False,
-                 constant_offset_export_only: bool = False):
+                 constant_offset_export_only: bool = False,
+                 auto_intro_align: bool = True):
         super().__init__()
         self.pairs = pairs
         self.hamming_threshold = hamming_threshold
@@ -74,6 +75,7 @@ class PairListSyncWorker(QThread):
         self.scene_cut_mode = scene_cut_mode
         self.debug_verify = debug_verify
         self.constant_offset_export_only = constant_offset_export_only
+        self.auto_intro_align = auto_intro_align
         self._cancelled = False
 
     def cancel(self):
@@ -82,7 +84,7 @@ class PairListSyncWorker(QThread):
     def run(self):
         succeeded = 0
         failed = 0
-        engine = VisualSyncEngine()
+        engine = VisualSyncEngine(auto_intro_align=self.auto_intro_align)
 
         try:
             total = len(self.pairs)
@@ -980,6 +982,18 @@ class MainWindow(QMainWindow):
         self._preview_check.setChecked(True)
         settings_layout.addWidget(self._preview_check)
 
+        self._intro_align_check = QCheckBox(
+            "Auto-detect Primary-only intro (first shared frame with Target)"
+        )
+        self._intro_align_check.setChecked(True)
+        self._intro_align_check.setToolTip(
+            "For dubs that start on episode content while Primary has a long "
+            "broadcaster intro: probe early Target frames against the full "
+            "Primary timeline and lock sync past the intro instead of "
+            "matching inside it."
+        )
+        settings_layout.addWidget(self._intro_align_check)
+
         self._constant_offset_check = QCheckBox(
             "Constant offset export only (no segmented / black filler / piecewise encode)"
         )
@@ -1110,6 +1124,7 @@ class MainWindow(QMainWindow):
         cut_mode = self._cut_combo.currentData()
         debug_verify = self._debug_verify_check.isChecked()
         constant_offset_only = self._constant_offset_check.isChecked()
+        auto_intro_align = self._intro_align_check.isChecked()
 
         mode_label = {
             "off": "single ref",
@@ -1131,6 +1146,7 @@ class MainWindow(QMainWindow):
             f"Scene-Cut: {verify_label.get(cut_mode, cut_mode)} | "
             f"Difference preview: {'on' if preview else 'off'} | "
             f"Constant-offset export: {'on' if constant_offset_only else 'off'} | "
+            f"Intro align: {'on' if auto_intro_align else 'off'} | "
             f"Debug verify: {'on' if debug_verify else 'off'}"
         )
 
@@ -1138,7 +1154,8 @@ class MainWindow(QMainWindow):
                                     multi_ref_mode=multi_mode, num_refs=num_refs,
                                     audio_mode=audio_mode, scene_cut_mode=cut_mode,
                                     debug_verify=debug_verify,
-                                    constant_offset_export_only=constant_offset_only)
+                                    constant_offset_export_only=constant_offset_only,
+                                    auto_intro_align=auto_intro_align)
         worker.log_signal.connect(self._on_log)
         worker.scan_progress.connect(self._scan_bar.set_progress)
         worker.export_progress.connect(self._export_bar.set_progress)

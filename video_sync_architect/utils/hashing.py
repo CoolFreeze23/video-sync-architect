@@ -48,6 +48,31 @@ def frame_has_content(raw_bytes: bytes, width: int = THUMB_W,
     return laplacian_var > variance_threshold
 
 
+def select_first_content_frame(filepath: str, fps: float, total_frames: int,
+                               max_scan_seconds: float = 120.0,
+                               variance_threshold: float = 50.0
+                               ) -> Optional[tuple[int, bytes]]:
+    """
+    First frame with real picture content near the start of a file
+    (e.g. Target that begins on episode with no broadcaster intro).
+    """
+    from .ffmpeg_utils import extract_frame_at_index
+
+    if fps <= 0 or total_frames <= 0:
+        return None
+    end_frame = min(total_frames, int(max_scan_seconds * fps))
+    step = max(1, int(fps // 2))
+    for idx in range(0, end_frame, step):
+        raw = extract_frame_at_index(filepath, idx, fps)
+        if raw and frame_has_content(raw, variance_threshold=variance_threshold):
+            return idx, raw
+    for idx in range(0, end_frame):
+        raw = extract_frame_at_index(filepath, idx, fps)
+        if raw and frame_has_content(raw, variance_threshold=variance_threshold / 2):
+            return idx, raw
+    return None
+
+
 def select_reference_frame(filepath: str, fps: float, total_frames: int,
                            skip_seconds: float = 30.0,
                            variance_threshold: float = 50.0) -> Optional[tuple[int, bytes]]:

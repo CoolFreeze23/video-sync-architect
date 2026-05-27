@@ -15,11 +15,13 @@ from ..utils.hashing import (
     hamming_distance,
     select_reference_frame,
     select_reference_frames,
+    select_first_content_frame,
     frame_has_content,
     THUMB_W,
     THUMB_H,
 )
 from ..utils.ffmpeg_utils import extract_frames_range, extract_frame_at_index
+from .content_align import find_shared_content_anchor, ContentStartAnchor
 
 
 def _phash_hamming_at_primary_frame(
@@ -85,10 +87,58 @@ class VisualSyncEngine(SyncEngine):
     """
 
     def __init__(self, coarse_step: int = 6, fine_window: int = 22,
-                 skip_seconds: float = 30.0):
+                 skip_seconds: float = 30.0,
+                 auto_intro_align: bool = True):
         self.coarse_step = coarse_step
         self.fine_window = fine_window
         self.skip_seconds = skip_seconds
+        self.auto_intro_align = auto_intro_align
+
+    def _refine_primary_match(
+        self,
+        primary: MediaInfo,
+        ref_hash,
+        center_frame: int,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> tuple[int, int, float, float]:
+        """Fine-scan around `center_frame` and parabolic sub-frame fit."""
+        total = primary.total_frames
+        best_hd = 999
+        best_frame = center_frame
+        window_start = max(0, center_frame - self.fine_window)
+        window_end = min(total, center_frame + self.fine_window + 1)
+
+        for frame_idx, raw_data in extract_frames_range(
+            primary.filepath, window_start, window_end, primary.fps, step=1,
+        ):
+            if cancel_check and cancel_check():
+                break
+            d = hamming_distance(ref_hash, compute_phash_from_raw(raw_data))
+            if d < best_hd:
+                best_hd = d
+                best_frame = frame_idx
+
+        hd_minus = (
+            _phash_hamming_at_primary_frame(
+                primary.filepath, primary.fps, best_frame - 1, ref_hash,
+            )
+            if best_frame > 0
+            else None
+        )
+        hd_plus = (
+            _phash_hamming_at_primary_frame(
+                primary.filepath, primary.fps, best_frame + 1, ref_hash,
+            )
+            if best_frame < total - 1
+            else None
+        )
+        sub_delta = _parabolic_subdelta_from_hd_neighbors(
+            hd_minus, best_hd, hd_plus,
+        )
+        matched_time = (
+            (best_frame + sub_delta) / primary.fps if primary.fps > 0 else 0.0
+        )
+        return best_frame, best_hd, sub_delta, matched_time
 
     def find_offset(
         self,
@@ -106,12 +156,36 @@ class VisualSyncEngine(SyncEngine):
         def is_cancelled() -> bool:
             return cancel_check() if cancel_check else False
 
+        intro_anchor: Optional[ContentStartAnchor] = None
+        if self.auto_intro_align:
+            intro_anchor = find_shared_content_anchor(
+                primary, target,
+                coarse_step=max(self.coarse_step, 8),
+                fine_window=self.fine_window,
+                hamming_threshold=hamming_threshold,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
+
         # --- Select reference frame from Input 2 (Target) ---
         log("Selecting reference frame from Target video...", 0.0)
-        ref_result = select_reference_frame(
-            target.filepath, target.fps, target.total_frames,
-            skip_seconds=self.skip_seconds,
-        )
+        ref_result = None
+        if intro_anchor is not None:
+            ref_raw = extract_frame_at_index(
+                target.filepath, intro_anchor.target_frame, target.fps,
+            )
+            if ref_raw:
+                ref_result = (intro_anchor.target_frame, ref_raw)
+        if ref_result is None and self.auto_intro_align:
+            ref_result = select_first_content_frame(
+                target.filepath, target.fps, target.total_frames,
+            )
+        if ref_result is None:
+            ref_skip = 2.0 if self.auto_intro_align else self.skip_seconds
+            ref_result = select_reference_frame(
+                target.filepath, target.fps, target.total_frames,
+                skip_seconds=ref_skip,
+            )
         if ref_result is None:
             log("ERROR: Could not select a reference frame from Target.", 0.0)
             return None
@@ -226,6 +300,32 @@ class VisualSyncEngine(SyncEngine):
             (best_frame + sub_delta) / primary.fps if primary.fps > 0 else 0.0
         )
         offset_seconds = matched_time - ref_time
+
+        intro_guard_s = 8.0
+        if (
+            intro_anchor is not None
+            and intro_anchor.median_hd <= hamming_threshold
+            and matched_time < intro_anchor.primary_time - intro_guard_s
+        ):
+            log(
+                f"Standard match at Primary t={matched_time:.2f}s is inside a "
+                f"Primary-only intro; re-locking to first shared content at "
+                f"t≈{intro_anchor.primary_time:.2f}s.",
+                -1,
+            )
+            ref_frame_idx = intro_anchor.target_frame
+            ref_time = intro_anchor.target_time
+            anchor_raw = extract_frame_at_index(
+                target.filepath, ref_frame_idx, target.fps,
+            )
+            if anchor_raw:
+                ref_hash = compute_phash_from_raw(anchor_raw)
+            best_frame, best_distance, sub_delta, matched_time = (
+                self._refine_primary_match(
+                    primary, ref_hash, intro_anchor.primary_frame, is_cancelled,
+                )
+            )
+            offset_seconds = matched_time - ref_time
 
         if best_distance <= hamming_threshold // 3:
             confidence = "high"
